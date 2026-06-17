@@ -13,6 +13,8 @@
 
 #include "ICameraDevice.h"
 
+class TriggerBarrier;
+
 // ICameraDevice 的海康威视实现：单路工业相机（彩色或黑白），映射到 PreviewStream::Color。
 //
 // 线程模型：帧经 SDK 内部线程经 MV_CC_RegisterImageCallBackEx 回调到达，回调里转成 QImage、
@@ -43,6 +45,7 @@ public:
     std::string lastError() const override;
 
     bool trigger() override;
+    bool captureTriggerSet(TriggerShot &out, TriggerBarrier &barrier, int perStepTimeoutMs) override;
 
     std::vector<ExposureTarget> supportedTargets() const override;
     bool                        isTargetSupported(ExposureTarget t) const override;
@@ -64,12 +67,14 @@ public:
     std::string                streamDiagnostics() const override;
     bool                       latestFrameTiming(FrameTiming &out) const override;
     void                       calibrateClock(uint64_t hostRefUs) override;
+    void                       syncClock() override;
 
 private:
     static void __stdcall frameCallback(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pInfo, void *pUser);
     void                  onFrame(unsigned char *pData, MV_FRAME_OUT_INFO_EX *pInfo);
     void                  setError(const std::string &msg);
     static uint64_t       nowEpochUs();
+    bool                  waitNewFrame(uint64_t baseline, int timeoutMs) const;
 
     void *handle_;
 

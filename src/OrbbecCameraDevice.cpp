@@ -1,9 +1,11 @@
 #include "OrbbecCameraDevice.h"
 
 #include <chrono>
+#include <thread>
 #include <utility>
 
 #include "FrameConverter.h"
+#include "TriggerBarrier.h"
 
 namespace {
 
@@ -115,18 +117,17 @@ bool OrbbecCameraDevice::startStream(bool triggerMode) {
     state_.store(CamState::Starting);
     triggerMode_.store(triggerMode);
 
-    // 新一轮采集：清掉上次的"出帧"标记与残留帧，避免沿用已不再开启的流（如本次回退到仅深度）。
+    // 新一轮采集：清掉上次的"出帧"标记与残留帧。
     depthAlive_.store(false);
     irAlive_.store(false);
     colorAlive_.store(false);
-    tsAnchorSet_.store(false);  // 时间戳锚点随新采集重建
+    tsAnchorSet_.store(false);
     {
         std::lock_guard<std::mutex> lk(frameMutex_);
         latestFrameSet_.reset();
     }
 
-    // 启用全局时间戳：把帧的捕获时刻换算到主机时钟域并消除设备计时漂移，
-    // 使多机/跨厂商时间戳可在同一条主机轴上比较。部分型号不支持时回退到锚点换算。
+    // 启用全局时间戳（多机时间轴对齐）。
     try {
         if (device_ && device_->isGlobalTimestampSupported()) {
             device_->enableGlobalTimestamp(true);
@@ -138,10 +139,11 @@ bool OrbbecCameraDevice::startStream(bool triggerMode) {
         globalTsEnabled_.store(false);
     }
 
-    // 配置多设备同步模式
+    // 配置多设备同步模式：预览态用 FREE_RUN（彩色连续出帧），触发态用软触发。
     try {
         OBMultiDeviceSyncConfig sc{};
-        sc.syncMode         = triggerMode ? OB_MULTI_DEVICE_SYNC_MODE_SOFTWARE_TRIGGERING : OB_MULTI_DEVICE_SYNC_MODE_FREE_RUN;
+        sc.syncMode = triggerMode ? OB_MULTI_DEVICE_SYNC_MODE_SOFTWARE_TRIGGERING
+                                  : OB_MULTI_DEVICE_SYNC_MODE_FREE_RUN;
         sc.framesPerTrigger = 1;
         sc.triggerOutEnable = false;
         device_->setMultiDeviceSyncConfig(sc);
@@ -149,44 +151,83 @@ bool OrbbecCameraDevice::startStream(bool triggerMode) {
         // 部分型号不支持设置同步模式；忽略并按默认模式继续。
     }
 
-    ob::Pipeline::FrameSetCallback cb = [this](std::shared_ptr<ob::FrameSet> fs) { this->onFrameSet(fs); };
+    // 预览只跑彩色：触发保存时由 captureTriggerSet 做停流→切 IR channel→恢复彩色 的分时序列。
+    if (!startColorPreview(0)) {
+        return false;
+    }
+    return true;
+}
 
-    // 启用 彩色 + 左右红外（不启用深度）；若启动失败再回退到仅彩色。
+// 启动"仅彩色"配置的预览（先确保 pipeline 是停的）。waitFirstFrameMs>0 时等首帧到达。
+bool OrbbecCameraDevice::startColorPreview(int waitFirstFrameMs) {
+    if (!pipeline_) {
+        return false;
+    }
+    ob::Pipeline::FrameSetCallback cb = [this](std::shared_ptr<ob::FrameSet> fs) { this->onFrameSet(fs); };
     try {
         std::shared_ptr<ob::Config> config = std::make_shared<ob::Config>();
         if (hasSensor(OB_SENSOR_COLOR)) {
             config->enableVideoStream(OB_SENSOR_COLOR);
+            pipeline_->start(config, cb);
+        } else {
+            // 无彩色传感器：交给 SDK 默认配置（预览效果会退化，但保证不空跑）。
+            pipeline_->start(std::shared_ptr<ob::Config>(), cb);
         }
-        if (hasSensor(OB_SENSOR_IR_LEFT)) {
+        state_.store(CamState::Streaming);
+    } catch (const ob::Error &e) {
+        setError(std::string("启动彩色预览失败: ") + e.what());
+        return false;
+    }
+    if (waitFirstFrameMs > 0) {
+        const uint64_t baseline = frameCount_.load();
+        waitNewFrame(baseline, waitFirstFrameMs);
+    }
+    return true;
+}
+
+// 启动单 IR 流并设定 IR_CHANNEL_DATA_SOURCE_INT（0=左 sensor, 1=右 sensor）。
+bool OrbbecCameraDevice::startIrChannel(int channel) {
+    if (!pipeline_) {
+        return false;
+    }
+    // 切 channel 必须在管线停止状态下进行。
+    try {
+        if (device_ && device_->isPropertySupported(OB_PROP_IR_CHANNEL_DATA_SOURCE_INT, OB_PERMISSION_READ_WRITE)) {
+            device_->setIntProperty(OB_PROP_IR_CHANNEL_DATA_SOURCE_INT, channel);
+        }
+    } catch (const ob::Error &) {
+        // 不支持/失败则继续——部分型号默认通道也能取到一路 IR。
+    }
+    ob::Pipeline::FrameSetCallback cb = [this](std::shared_ptr<ob::FrameSet> fs) { this->onFrameSet(fs); };
+    try {
+        std::shared_ptr<ob::Config> config = std::make_shared<ob::Config>();
+        if (hasSensor(OB_SENSOR_IR)) {
+            config->enableVideoStream(OB_SENSOR_IR);
+        } else if (channel == 0 && hasSensor(OB_SENSOR_IR_LEFT)) {
+            config->enableVideoStream(OB_SENSOR_IR_LEFT);
+        } else if (channel == 1 && hasSensor(OB_SENSOR_IR_RIGHT)) {
+            config->enableVideoStream(OB_SENSOR_IR_RIGHT);
+        } else if (hasSensor(OB_SENSOR_IR_LEFT)) {
+            // 兜底：沿用左 IR sensor，channel 切换交给 IR_CHANNEL_DATA_SOURCE_INT。
             config->enableVideoStream(OB_SENSOR_IR_LEFT);
         }
-        if (hasSensor(OB_SENSOR_IR_RIGHT)) {
-            config->enableVideoStream(OB_SENSOR_IR_RIGHT);
-        }
-        // 设备只有单路 IR（无左右）时退而启用单 IR
-        if (!hasSensor(OB_SENSOR_IR_LEFT) && !hasSensor(OB_SENSOR_IR_RIGHT) && hasSensor(OB_SENSOR_IR)) {
-            config->enableVideoStream(OB_SENSOR_IR);
-        }
         pipeline_->start(config, cb);
-        state_.store(CamState::Streaming);
-        return true;
     } catch (const ob::Error &e) {
-        // 回退：仅彩色流（若无彩色传感器则交给 SDK 默认配置）
-        try {
-            if (hasSensor(OB_SENSOR_COLOR)) {
-                std::shared_ptr<ob::Config> config = std::make_shared<ob::Config>();
-                config->enableVideoStream(OB_SENSOR_COLOR);
-                pipeline_->start(config, cb);
-            } else {
-                pipeline_->start(std::shared_ptr<ob::Config>(), cb);  // nullptr => SDK 默认配置
-            }
-            state_.store(CamState::Streaming);
-            return true;
-        } catch (const ob::Error &e2) {
-            setError(std::string("启动采集失败: ") + e2.what());
-            return false;
-        }
+        setError(std::string("启动 IR 流失败: ") + e.what());
+        return false;
     }
+    return true;
+}
+
+bool OrbbecCameraDevice::waitNewFrame(uint64_t baseline, int timeoutMs) const {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (frameCount_.load() > baseline) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
 }
 
 void OrbbecCameraDevice::stopStream() {
@@ -218,6 +259,54 @@ bool OrbbecCameraDevice::trigger() {
     } catch (const ob::Error &) {
         return false;
     }
+}
+
+// 一次触发保存的完整分时序列（后台线程，阻塞）：
+//   1) 屏障对齐 → 保存预览缓冲里最近的彩色帧 + 其时间信息（主帧，与其他厂商主曝光同瞬间）；
+//   2) 停彩色流 → 开 IR channel 0 取左 IR → 停 → 开 IR channel 1 取右 IR → 停；
+//   3) 无论成败恢复彩色 free-run 预览。
+bool OrbbecCameraDevice::captureTriggerSet(TriggerShot &out, TriggerBarrier &barrier, int perStepTimeoutMs) {
+    // 序列结束总是恢复彩色预览（RAII 兜底，覆盖任何提前返回路径）。
+    struct PreviewRestorer {
+        OrbbecCameraDevice *self;
+        ~PreviewRestorer() {
+            self->stopStream();
+            self->startColorPreview(0);
+        }
+    } restorer{this};
+
+    // 屏障对齐：与海康/迈德威视的主帧触发尽量同瞬间释放。
+    barrier.arrive();
+    barrier.wait();
+
+    // 主帧：直接取预览缓冲里最近的彩色帧（spec 要求"保存最近的彩色帧"），并记录其时间信息。
+    out.color = latestImage(PreviewStream::Color);
+    latestFrameTiming(out.timing);
+
+    // 切到分时取 IR：先停彩色流。
+    stopStream();
+
+    // 左 IR：channel 0。
+    {
+        const uint64_t baseline = frameCount_.load();
+        if (startIrChannel(0) && waitNewFrame(baseline, perStepTimeoutMs)) {
+            out.left = latestImage(PreviewStream::IR);
+        }
+        stopStream();
+    }
+
+    // 右 IR：channel 1。
+    {
+        const uint64_t baseline = frameCount_.load();
+        if (startIrChannel(1) && waitNewFrame(baseline, perStepTimeoutMs)) {
+            out.right = latestImage(PreviewStream::IR);
+        }
+        stopStream();
+    }
+
+    // 至少主帧（彩色）有效即视为成功；IR 缺失不致命（型号/通道差异）。
+    out.ok = !out.color.isNull() || !out.left.isNull() || !out.right.isNull();
+    return out.ok;
 }
 
 // ---------------- 帧回调 ----------------

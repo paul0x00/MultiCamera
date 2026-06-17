@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 
+#include <QImage>
+
 // 与具体相机 SDK 无关的公共类型，供界面、CameraManager 与各厂商后端共用。
 
 // 单台相机的运行状态。
@@ -40,6 +42,19 @@ struct FrameTiming {
     uint64_t captureRawUs = 0;      // 设备原始时间戳（µs），仅调试/溯源用，不跨厂商比较
     uint32_t exposureUs   = 0;      // 曝光时长（µs，best-effort）；需要中点时由使用方减 exposureUs/2
     bool     valid        = false;  // 是否取到有效时间信息
+};
+
+// 一次"触发保存"中单台相机抓到的成果。各厂商按需填充：
+//  - Orbbec：color=彩色帧，left/right=左右红外（分时切 channel 取得）；timing 取彩色帧（主曝光）。
+//  - 海康：color=彩色帧；timing 取该帧。
+//  - 迈德威视：left/right=整帧切分的左右目灰度；timing 取该帧。
+// 未产出的路保持空 QImage。ok=false 表示本次抓取失败（超时/异常）。
+struct TriggerShot {
+    QImage      color;
+    QImage      left;
+    QImage      right;
+    FrameTiming timing;
+    bool        ok = false;
 };
 
 // 枚举到的设备信息（用于设备列表展示，未必已连接）。

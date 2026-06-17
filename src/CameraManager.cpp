@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "OrbbecBackend.h"
+#include "TriggerBarrier.h"
 #ifdef _WIN32
 #include "HikvisionBackend.h"
 #include "MindvisionBackend.h"
@@ -18,7 +19,8 @@ uint64_t nowEpochUs() {
 }
 }  // namespace
 
-CameraManager::CameraManager() : abortStart_(false), capturing_(false) {
+CameraManager::CameraManager()
+    : abortStart_(false), capturing_(false), clockSyncRunning_(false), clockSyncIntervalMs_(1000) {
     // 注册可用后端；接入新厂商时在此追加。海康/迈德威视 SDK 仅 Windows 可用。
     backends_.push_back(std::make_shared<OrbbecBackend>());
 #ifdef _WIN32
@@ -28,6 +30,7 @@ CameraManager::CameraManager() : abortStart_(false), capturing_(false) {
 }
 
 CameraManager::~CameraManager() {
+    stopClockSync();
     stopCapture();
     disconnectAll();
     backends_.clear();
@@ -105,8 +108,9 @@ bool CameraManager::connect(const std::string &serial, std::string &err) {
         std::lock_guard<std::mutex> lk(mutex_);
         devices_.push_back(camera);
     }
-    // 连接后对齐所有已打开设备的时钟（多机时间戳同步）。
+    // 连接后对齐所有已打开设备的时钟（多机时间戳同步），并确保周期同步线程在运行。
     syncDeviceClocks();
+    startClockSync(clockSyncIntervalMs_);
     return true;
 }
 
@@ -195,6 +199,8 @@ void CameraManager::disconnectAll() {
         std::lock_guard<std::mutex> lk(mutex_);
         toRelease.swap(devices_);
     }
+    // 没有设备后停掉周期时钟同步线程。
+    stopClockSync();
     for (size_t i = 0; i < toRelease.size(); ++i) {
         toRelease[i]->stopStream();
     }
@@ -237,50 +243,80 @@ void CameraManager::stopCapture() {
     capturing_.store(false);
 }
 
-uint64_t CameraManager::triggerAll() {
+std::vector<CaptureResult> CameraManager::captureTriggerSets(int perStepTimeoutMs, uint64_t &dispatchUs) {
     std::vector<std::shared_ptr<ICameraDevice>> devs = connectedDevices();
 
-    // 仅对正在采集的相机触发
+    // 仅对正在采集的相机触发。
     std::vector<std::shared_ptr<ICameraDevice>> active;
     for (size_t i = 0; i < devs.size(); ++i) {
         if (devs[i]->isStreaming()) {
             active.push_back(devs[i]);
         }
     }
+
+    std::vector<CaptureResult> results(active.size());
+    for (size_t i = 0; i < active.size(); ++i) {
+        results[i].dev = active[i];
+    }
     if (active.empty()) {
-        return nowEpochUs();
+        dispatchUs = nowEpochUs();
+        return results;
     }
 
-    // 并行屏障：每台一个线程，先在 go 上自旋等待；待全部就位后主线程统一置位释放，
-    // 使各相机的 trigger() 近乎同瞬间发出，把派发偏差压到亚毫秒级。
-    std::atomic<bool> go(false);
-    std::atomic<int>  ready(0);
-    const int         n = static_cast<int>(active.size());
+    // 共享屏障：每台一个线程跑各自的 captureTriggerSet 序列，先各自准备好后在屏障等齐；
+    // 主线程待全部就位统一释放并记录派发时刻，使各机主曝光尽量同瞬间。
+    TriggerBarrier barrier;
+    barrier.setExpected(static_cast<int>(active.size()));
 
     std::vector<std::thread> workers;
     workers.reserve(active.size());
     for (size_t i = 0; i < active.size(); ++i) {
         std::shared_ptr<ICameraDevice> dev = active[i];
-        workers.push_back(std::thread([&go, &ready, dev]() {
-            ready.fetch_add(1);
-            while (!go.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            dev->trigger();
+        TriggerShot *shot = &results[i].shot;
+        workers.push_back(std::thread([dev, shot, &barrier, perStepTimeoutMs]() {
+            // captureTriggerSet 内部负责 arrive()/wait()（即使准备失败也须 arrive 一次）。
+            dev->captureTriggerSet(*shot, barrier, perStepTimeoutMs);
         }));
     }
 
-    // 等所有线程就位，再统一释放并记录派发时刻
-    while (ready.load() < n) {
-        std::this_thread::yield();
-    }
-    const uint64_t tTrigger = nowEpochUs();
-    go.store(true, std::memory_order_release);
+    // 等所有线程就位 → 记录派发时刻 → 统一释放。
+    barrier.waitAllReady();
+    dispatchUs = barrier.releaseAndStamp(nowEpochUs());
 
     for (size_t i = 0; i < workers.size(); ++i) {
         workers[i].join();
     }
-    return tTrigger;
+    return results;
+}
+
+void CameraManager::startClockSync(int intervalMs) {
+    if (clockSyncRunning_.load()) {
+        return;  // 已在运行
+    }
+    clockSyncIntervalMs_ = intervalMs > 0 ? intervalMs : 1000;
+    clockSyncRunning_.store(true);
+    clockSyncThread_ = std::thread([this]() {
+        while (clockSyncRunning_.load()) {
+            std::vector<std::shared_ptr<ICameraDevice>> devs = connectedDevices();
+            for (size_t i = 0; i < devs.size(); ++i) {
+                devs[i]->syncClock();
+            }
+            // 分片睡眠，便于及时响应停止。
+            const int slice = 50;
+            int       slept = 0;
+            while (slept < clockSyncIntervalMs_ && clockSyncRunning_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+                slept += slice;
+            }
+        }
+    });
+}
+
+void CameraManager::stopClockSync() {
+    clockSyncRunning_.store(false);
+    if (clockSyncThread_.joinable()) {
+        clockSyncThread_.join();
+    }
 }
 
 std::vector<std::shared_ptr<ICameraDevice>> CameraManager::connectedDevices() const {

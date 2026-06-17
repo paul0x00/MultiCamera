@@ -41,7 +41,7 @@ CameraView::CameraView(int index, QWidget *parent) : QWidget(parent), index_(ind
     v->addWidget(infoLabel_, 0);
 
     imageLabel_ = new QLabel(this);
-    imageLabel_->setFixedSize(480, 270);  // 固定大小（16:9），4 块按 2×2 排布
+    imageLabel_->setFixedSize(320, 180);  // 固定大小（16:9），6 块按 2×3 排布
     imageLabel_->setAlignment(Qt::AlignCenter);
     imageLabel_->setStyleSheet("background:#1e1e1e;color:#888;border:1px solid #444;");
     v->addWidget(imageLabel_, 0);
@@ -68,7 +68,7 @@ void CameraView::clear() {
 
 // ============================ MainWindow ============================
 
-MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
+MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), triggerBusy_(false) {
     setWindowTitle(QString::fromUtf8("Gemini 215 多相机控制台"));
     resize(1340, 800);
 
@@ -79,14 +79,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     QHBoxLayout *row = new QHBoxLayout();
     outer->addLayout(row, 1);
 
-    // 左：固定 2×2 预览（四槽，编号 1~4；槽 i 显示第 i 台已连接相机）
+    // 左：固定 2×3 预览（六槽）。按厂商映射：槽0/1/2=Orbbec，槽3=海康，槽4/5=迈德威视左/右。
     QWidget *previewContainer = new QWidget(this);
     previewGrid_              = new QGridLayout(previewContainer);
     previewGrid_->setContentsMargins(6, 6, 6, 6);
     previewGrid_->setSpacing(6);
-    const int cols = 2;
-    for (int i = 0; i < 4; ++i) {
-        slots_[i] = new CameraView(i + 1, previewContainer);
+    const int cols = 3;
+    for (int i = 0; i < 6; ++i) {
+        slots_[i]      = new CameraView(i + 1, previewContainer);
+        slotStream_[i] = PreviewStream::Color;
         previewGrid_->addWidget(slots_[i], i / cols, i % cols);
     }
     row->addWidget(previewContainer, 1, Qt::AlignTop | Qt::AlignLeft);
@@ -108,6 +109,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     timer_ = new QTimer(this);
     connect(timer_, &QTimer::timeout, this, [this]() { onTick(); });
     timer_->start(33);
+
+    // 后台触发线程完成后经此信号回到 GUI 线程写盘（跨线程须 QueuedConnection + 注册 metatype）。
+    qRegisterMetaType<TriggerBatch>("TriggerBatch");
+    connect(this, &MainWindow::triggerBatchReady, this,
+            [this](TriggerBatch batch) { saveBatch(batch); }, Qt::QueuedConnection);
 
     populateParamPanel();
     updateButtonStates();
@@ -139,6 +145,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 MainWindow::~MainWindow() {
     if (timer_) {
         timer_->stop();
+    }
+    // 等后台触发线程结束，避免析构后线程仍访问 manager_。
+    if (triggerThread_.joinable()) {
+        triggerThread_.join();
     }
     // manager_ 析构会停止采集并断开所有设备
 }
@@ -352,103 +362,67 @@ QString sanitizeModel(const std::string &raw) {
 }  // namespace
 
 void MainWindow::onTriggerSave() {
-    if (triggerPollTimer_ && triggerPollTimer_->isActive()) {
-        log(QString::fromUtf8("上一次触发仍在等待出帧，请稍候。"), true);
+    if (triggerBusy_.load()) {
+        log(QString::fromUtf8("上一次触发保存仍在进行，请稍候。"), true);
         return;
     }
-
-    std::vector<std::shared_ptr<ICameraDevice>> devs = manager_.connectedDevices();
-    if (devs.empty()) {
+    if (manager_.connectedCount() == 0) {
         log(QString::fromUtf8("没有已连接的相机，无法保存。"));
         return;
     }
 
     const int seq = ++triggerSeq_;
+    log(QString::fromUtf8("触发 #%1：后台发起触发保存序列（Orbbec 将分时取彩色+左右IR）…").arg(seq));
 
-    // 输出目录（可执行文件所在目录下）
+    // 上一个线程若已结束需先 join，避免 std::thread 赋值时仍 joinable 触发 terminate。
+    if (triggerThread_.joinable()) {
+        triggerThread_.join();
+    }
+    triggerBusy_.store(true);
+    updateButtonStates();
+
+    // 后台线程跑阻塞的 captureTriggerSets（含 Orbbec 停流/切 IR channel/恢复，耗时几百 ms），
+    // 完成后经 triggerBatchReady 信号把成果送回 GUI 线程写盘。
+    triggerThread_ = std::thread([this, seq]() {
+        TriggerBatch batch;
+        batch.seq     = seq;
+        batch.results = manager_.captureTriggerSets(800, batch.dispatchUs);
+        emit triggerBatchReady(batch);
+    });
+}
+
+void MainWindow::saveBatch(const TriggerBatch &batch) {
+    // 信号在 GUI 线程触发：先收尾后台线程句柄，解除忙标志。
+    if (triggerThread_.joinable()) {
+        triggerThread_.join();
+    }
+    triggerBusy_.store(false);
+
+    // 输出目录（可执行文件所在目录下），按厂商/路分目录。
     const QString base = QCoreApplication::applicationDirPath();
-    QDir().mkpath(base + "/middlecolor");
-    QDir().mkpath(base + "/leftir");
-    QDir().mkpath(base + "/rightir");
-    QDir().mkpath(base + "/timestamps");
+    const QString obColorDir = base + "/orbbec_color";
+    const QString obLeftDir  = base + "/orbbec_leftir";
+    const QString obRightDir = base + "/orbbec_rightir";
+    const QString hikDir     = base + "/hik_color";
+    const QString mvLeftDir  = base + "/mv_left";
+    const QString mvRightDir = base + "/mv_right";
+    const QString tsDir      = base + "/timestamps";
+    QDir().mkpath(obColorDir);
+    QDir().mkpath(obLeftDir);
+    QDir().mkpath(obRightDir);
+    QDir().mkpath(hikDir);
+    QDir().mkpath(mvLeftDir);
+    QDir().mkpath(mvRightDir);
+    QDir().mkpath(tsDir);
 
-    // 建立本次触发的待收集列表 + 触发前帧计数基线（超过它即为本次触发产生的新帧）
-    pendingShots_.clear();
-    pendingShots_.reserve(devs.size());
-    for (size_t i = 0; i < devs.size(); ++i) {
-        PendingShot s;
-        s.dev                = devs[i];
-        s.baselineFrameCount = devs[i]->frameCount();
-        pendingShots_.push_back(s);
-    }
-    pendingSeq_ = seq;
+    const QString seqStr = QString("%1").arg(batch.seq, 4, 10, QChar('0'));
 
-    // 并行屏障：尽可能同时下发软触发，记录派发时刻
-    pendingTriggerUs_  = manager_.triggerAll();
-    pendingDeadlineMs_ = QDateTime::currentMSecsSinceEpoch() + 500;  // 最多等 500ms
-
-    log(QString::fromUtf8("触发 #%1：已对 %2 台同时下发软触发，等待各相机出帧…")
-            .arg(seq)
-            .arg(static_cast<int>(devs.size())));
-
-    if (!triggerPollTimer_) {
-        triggerPollTimer_ = new QTimer(this);
-        triggerPollTimer_->setInterval(10);
-        connect(triggerPollTimer_, &QTimer::timeout, this, [this]() { pollTriggeredFrames(); });
-    }
-    triggerPollTimer_->start();
-    pollTriggeredFrames();  // 立即查一次（帧可能已到）
-}
-
-void MainWindow::pollTriggeredFrames() {
-    const bool deadlineHit = QDateTime::currentMSecsSinceEpoch() >= pendingDeadlineMs_;
-    bool       allReady    = true;
-
-    for (size_t i = 0; i < pendingShots_.size(); ++i) {
-        PendingShot &s = pendingShots_[i];
-        if (s.ready || s.timedOut) {
-            continue;
-        }
-        if (s.dev->frameCount() > s.baselineFrameCount) {
-            // 本次触发产生的新帧已到：抓取图像与时间信息
-            s.color = s.dev->latestImage(PreviewStream::Color);
-            s.left  = s.dev->latestImage(PreviewStream::IRLeft);
-            s.right = s.dev->latestImage(PreviewStream::IRRight);
-            s.dev->latestFrameTiming(s.timing);
-            s.ready = true;
-        } else {
-            allReady = false;
-        }
-    }
-
-    if (!allReady && !deadlineHit) {
-        return;  // 继续等
-    }
-    if (deadlineHit) {
-        for (size_t i = 0; i < pendingShots_.size(); ++i) {
-            if (!pendingShots_[i].ready) {
-                pendingShots_[i].timedOut = true;
-            }
-        }
-    }
-    triggerPollTimer_->stop();
-    finishShot();
-}
-
-void MainWindow::finishShot() {
-    const QString base     = QCoreApplication::applicationDirPath();
-    const QString colorDir = base + "/middlecolor";
-    const QString leftDir  = base + "/leftir";
-    const QString rightDir = base + "/rightir";
-    const QString tsDir    = base + "/timestamps";
-    const QString seqStr   = QString("%1").arg(pendingSeq_, 4, 10, QChar('0'));
-
-    // 以最早曝光时刻为基准，计算各机相对差值
+    // 以最早曝光时刻为基准，计算各机相对差值。
     uint64_t earliest     = 0;
     bool     haveEarliest = false;
-    for (size_t i = 0; i < pendingShots_.size(); ++i) {
-        const PendingShot &s = pendingShots_[i];
-        if (s.ready && s.timing.valid) {
+    for (size_t i = 0; i < batch.results.size(); ++i) {
+        const TriggerShot &s = batch.results[i].shot;
+        if (s.ok && s.timing.valid) {
             if (!haveEarliest || s.timing.hostEpochUs < earliest) {
                 earliest     = s.timing.hostEpochUs;
                 haveEarliest = true;
@@ -456,24 +430,26 @@ void MainWindow::finishShot() {
         }
     }
 
-    // sidecar：记录本次触发各机的曝光时刻（主机 epoch µs）与两两相对差，供后处理。
+    // sidecar：记录本次触发各机的曝光时刻（主机 epoch µs）与相对最早机的差，供后处理核对同步性。
     QString csv;
     csv += QString::fromUtf8("# trigger_seq=%1, dispatch_host_us=%2\n")
                .arg(seqStr)
-               .arg(static_cast<qulonglong>(pendingTriggerUs_));
-    csv += QString::fromUtf8("serial,name,host_epoch_us,capture_raw_us,exposure_us,delta_to_earliest_us,status\n");
+               .arg(static_cast<qulonglong>(batch.dispatchUs));
+    csv += QString::fromUtf8("vendor,serial,name,host_epoch_us,capture_raw_us,exposure_us,delta_to_earliest_us,status\n");
 
     int      savedCount = 0;
     uint64_t maxDelta   = 0;
 
-    for (size_t i = 0; i < pendingShots_.size(); ++i) {
-        PendingShot  &s      = pendingShots_[i];
-        const QString model  = sanitizeModel(s.dev->name());
-        const QString serial = QString::fromStdString(s.dev->serial());
+    for (size_t i = 0; i < batch.results.size(); ++i) {
+        const std::shared_ptr<ICameraDevice> &dev    = batch.results[i].dev;
+        const TriggerShot                    &s      = batch.results[i].shot;
+        const QString                         vendor = QString::fromStdString(dev->vendor());
+        const QString                         model  = sanitizeModel(dev->name());
+        const QString                         serial = QString::fromStdString(dev->serial());
 
-        if (!s.ready) {
-            log(QString::fromUtf8("相机 %1 超时未出帧，未保存。").arg(serial), true);
-            csv += QString("%1,%2,,,,,timeout\n").arg(serial).arg(model);
+        if (!s.ok) {
+            log(QString::fromUtf8("相机 %1（%2）触发未取到帧，未保存。").arg(serial).arg(vendor), true);
+            csv += QString("%1,%2,%3,,,,,timeout\n").arg(vendor).arg(serial).arg(model);
             continue;
         }
 
@@ -482,9 +458,20 @@ void MainWindow::finishShot() {
         const QString  file   = model + "_" + serial + "_" + seqStr + "_" + tsStr + ".png";
 
         bool any = false;
-        if (!s.color.isNull() && s.color.save(colorDir + "/" + file, "PNG")) any = true;
-        if (!s.left.isNull() && s.left.save(leftDir + "/" + file, "PNG")) any = true;
-        if (!s.right.isNull() && s.right.save(rightDir + "/" + file, "PNG")) any = true;
+        if (!s.color.isNull()) {
+            // Orbbec 彩色 → orbbec_color；海康彩色 → hik_color。
+            const QString dir = (vendor == "Hikvision") ? hikDir : obColorDir;
+            if (s.color.save(dir + "/" + file, "PNG")) any = true;
+        }
+        if (!s.left.isNull()) {
+            // Orbbec 左 IR → orbbec_leftir；迈德威视左目 → mv_left。
+            const QString dir = (vendor == "MindVision") ? mvLeftDir : obLeftDir;
+            if (s.left.save(dir + "/" + file, "PNG")) any = true;
+        }
+        if (!s.right.isNull()) {
+            const QString dir = (vendor == "MindVision") ? mvRightDir : obRightDir;
+            if (s.right.save(dir + "/" + file, "PNG")) any = true;
+        }
         if (any) {
             ++savedCount;
         }
@@ -494,7 +481,8 @@ void MainWindow::finishShot() {
             maxDelta = delta;
         }
 
-        csv += QString("%1,%2,%3,%4,%5,%6,%7\n")
+        csv += QString("%1,%2,%3,%4,%5,%6,%7,%8\n")
+                   .arg(vendor)
                    .arg(serial)
                    .arg(model)
                    .arg(static_cast<qulonglong>(hostUs))
@@ -513,10 +501,10 @@ void MainWindow::finishShot() {
     log(QString::fromUtf8("触发 #%1 完成：保存 %2/%3 台，最大曝光时刻差 %4 ms。")
             .arg(seqStr)
             .arg(savedCount)
-            .arg(static_cast<int>(pendingShots_.size()))
+            .arg(static_cast<int>(batch.results.size()))
             .arg(maxDelta / 1000.0, 0, 'f', 1));
 
-    pendingShots_.clear();
+    updateButtonStates();
 }
 
 void MainWindow::onTick() {
@@ -555,33 +543,38 @@ void MainWindow::onTick() {
         }
     }
 
-    // 固定 4 槽：第 i 槽显示第 i 台已连接相机的彩色流，多出的槽置空（"无图像"）。
-    for (int i = 0; i < 4; ++i) {
-        CameraView *view = slots_[i];
-        if (i >= static_cast<int>(devs.size())) {
+    // 按厂商重建槽位映射（设备数量/连接状态可能变化）。
+    assignSlots();
+
+    // 六槽按厂商固定：槽0/1/2=Orbbec 彩色，槽3=海康彩色，槽4=迈德威视左目，槽5=迈德威视右目。
+    for (int i = 0; i < 6; ++i) {
+        CameraView                    *view = slots_[i];
+        std::shared_ptr<ICameraDevice> dev  = slotDev_[i];
+        if (!dev) {
             view->clear();
             continue;
         }
-        const std::string &sn = devs[i]->serial();
+        const std::string  &sn     = dev->serial();
+        const PreviewStream  stream = slotStream_[i];
 
-        // 采集后首次拿到帧时，打印一次流诊断，便于排查"看不到画面/存不了图"。
-        if (devs[i]->frameCount() > 0 && diagLogged_.find(sn) == diagLogged_.end()) {
+        // 采集后首次拿到帧时，打印一次流诊断（每台一次）。
+        if (dev->frameCount() > 0 && diagLogged_.find(sn) == diagLogged_.end()) {
             diagLogged_.insert(sn);
             log(QString::fromUtf8("相机 %1（%2）流诊断：%3")
                     .arg(i + 1)
                     .arg(QString::fromStdString(sn))
-                    .arg(QString::fromStdString(devs[i]->streamDiagnostics())));
+                    .arg(QString::fromStdString(dev->streamDiagnostics())));
         }
 
-        // 预览只显示彩色流。
-        QImage img = devs[i]->latestImage(PreviewStream::Color);
+        QImage img = dev->latestImage(stream);
         if (!img.isNull()) {
             view->showImage(img);
         }
-        QString info = QString::fromUtf8("相机 %1  ").arg(i + 1) + QString::fromStdString(sn) + "  " + stateText(devs[i]->state());
-        if (devs[i]->isStreaming()) {
+        QString info = QString::fromUtf8("相机 %1  ").arg(i + 1) + QString::fromStdString(sn) +
+                       "  " + QString::fromUtf8(previewStreamName(stream)) + "  " + stateText(dev->state());
+        if (dev->isStreaming()) {
             info += QString::fromUtf8("  %1fps").arg(fps_.count(sn) ? fps_[sn] : 0.0, 0, 'f', 1);
-            const std::string res = devs[i]->resolution(PreviewStream::Color);
+            const std::string res = dev->resolution(stream);
             if (!res.empty()) {
                 info += "  " + QString::fromStdString(res);
             }
@@ -590,6 +583,35 @@ void MainWindow::onTick() {
     }
 
     updateButtonStates();
+}
+
+// 按厂商把已连接设备路由到固定槽：Orbbec→0/1/2（彩色），海康→3（彩色），
+// 迈德威视→4（左目）/5（右目，同一台设备占两槽）。同厂商多台按连接顺序占位，超出则丢弃显示。
+void MainWindow::assignSlots() {
+    for (int i = 0; i < 6; ++i) {
+        slotDev_[i].reset();
+        slotStream_[i] = PreviewStream::Color;
+    }
+    std::vector<std::shared_ptr<ICameraDevice>> devs = manager_.connectedDevices();
+    int obNext = 0;  // 下一个空闲的 Orbbec 槽（0..2）
+    for (size_t i = 0; i < devs.size(); ++i) {
+        const std::string &vendor = devs[i]->vendor();
+        if (vendor == "Orbbec") {
+            if (obNext < 3) {
+                slotDev_[obNext]    = devs[i];
+                slotStream_[obNext] = PreviewStream::Color;
+                ++obNext;
+            }
+        } else if (vendor == "Hikvision") {
+            slotDev_[3]    = devs[i];
+            slotStream_[3] = PreviewStream::Color;
+        } else if (vendor == "MindVision") {
+            slotDev_[4]    = devs[i];
+            slotStream_[4] = PreviewStream::IRLeft;
+            slotDev_[5]    = devs[i];
+            slotStream_[5] = PreviewStream::IRRight;
+        }
+    }
 }
 
 // ---------------------------- 参数面板 ----------------------------
@@ -743,15 +765,18 @@ ExposureTarget MainWindow::currentTarget() const {
 void MainWindow::updateButtonStates() {
     const bool   capturing = manager_.isCapturing();
     const size_t connected = manager_.connectedCount();
+    const bool   triggering = triggerBusy_.load();
 
-    // 采集中禁止连接/断开，避免与错峰启动线程争用设备
+    // 采集中禁止连接/断开，避免与启动线程争用设备
     btnConnectAll_->setEnabled(!capturing);
     btnDisconnectAll_->setEnabled(!capturing && connected > 0);
 
     btnStart_->setEnabled(!capturing && connected > 0);
-    btnStop_->setEnabled(capturing);
-    btnCalibrate_->setEnabled(connected > 0);   // 连接后随时可标定（采集中亦可）
-    btnTrigger_->setEnabled(capturing);  // 采集中随时可触发保存
+    // 触发保存进行中禁止停止采集：分时序列正在停/起流，避免争用设备生命周期。
+    btnStop_->setEnabled(capturing && !triggering);
+    btnCalibrate_->setEnabled(connected > 0 && !triggering);
+    // 采集中且无进行中的触发保存时可触发。
+    btnTrigger_->setEnabled(capturing && !triggering);
 }
 
 QString MainWindow::stateText(CamState s) {

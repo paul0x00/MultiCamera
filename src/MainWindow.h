@@ -1,15 +1,18 @@
 #ifndef MAIN_WINDOW_H
 #define MAIN_WINDOW_H
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <QElapsedTimer>
 #include <QMainWindow>
+#include <QMetaType>
 #include <QWidget>
 
 #include "CameraManager.h"
@@ -41,12 +44,24 @@ private:
     QLabel *infoLabel_;
 };
 
+// 一次触发保存的成果（后台线程产出，经信号回到 GUI 线程写盘）。
+struct TriggerBatch {
+    std::vector<CaptureResult> results;
+    uint64_t                   dispatchUs = 0;
+    int                        seq        = 0;
+};
+Q_DECLARE_METATYPE(TriggerBatch)
+
 // 主窗口。
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
+
+signals:
+    // 后台触发线程完成时发射，携带成果回到 GUI 线程（Qt::QueuedConnection）。
+    void triggerBatchReady(TriggerBatch batch);
 
 private:
     // 构建界面
@@ -59,15 +74,17 @@ private:
     void onDisconnectAll();
     void onStartCapture();
     void onStopCapture();
-    void onTriggerSave();  // 对所有相机同时下发软触发，等齐各路新帧后保存并记录时间戳
+    void onTriggerSave();  // 后台线程对所有采集中相机发起触发保存序列
     void onCalibrateClocks();  // 时间戳标定：对齐各机内部时钟到同一主机轴
     void onTick();
 
-    // 触发保存流程（非阻塞）：onTriggerSave 下发触发并起轮询定时器；
-    // pollTriggeredFrames 等每台出"这次触发的新帧"后抓取图像+时间戳；
-    // 全部就绪或超时后 finishShot 统一写盘并输出时间戳 sidecar。
-    void pollTriggeredFrames();
-    void finishShot();
+    // 触发保存：onTriggerSave 起后台线程跑 manager_.captureTriggerSets（阻塞，含 Orbbec 分时序列），
+    // 完成后经 triggerBatchReady 信号回到 GUI 线程，由 saveBatch 统一写盘并输出时间戳 sidecar。
+    void saveBatch(const TriggerBatch &batch);
+
+    // 槽位分配：按厂商把设备路由到固定槽（Orbbec→0/1/2，海康→3，迈德威视左→4/右→5）。
+    // 返回 (槽号, 该槽显示的预览流)。同厂商多台按连接顺序占位。
+    void assignSlots();
 
     // 参数面板
     void populateParamPanel();   // 依据选中相机重建"目标"下拉
@@ -108,9 +125,13 @@ private:
     // 日志
     QPlainTextEdit *logEdit_ = nullptr;
 
-    // 预览（固定 2×2 四槽，槽 i 显示第 i 台已连接相机，无则置空）
+    // 预览（固定 2×3 六槽）：按厂商映射——槽0/1/2=Orbbec 彩色，槽3=海康彩色，
+    // 槽4=迈德威视左目，槽5=迈德威视右目。每槽记录显示哪台设备的哪一路流。
     QGridLayout *previewGrid_ = nullptr;
-    CameraView  *slots_[4]    = {nullptr, nullptr, nullptr, nullptr};
+    CameraView  *slots_[6]    = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    // 槽 → (设备, 预览流)。assignSlots 重建；onTick 据此刷新各槽。
+    std::shared_ptr<ICameraDevice> slotDev_[6];
+    PreviewStream                  slotStream_[6];
 
     // FPS 计算（每1秒更新一次）
     std::map<std::string, uint64_t> lastFrameCount_;
@@ -121,24 +142,9 @@ private:
     int  triggerSeq_    = 0;      // 触发保存的递增序号（每次点击+1）
     std::set<std::string> diagLogged_;  // 已打印过流诊断的相机（每次采集打印一次）
 
-    // 一次"触发保存"中单台相机的待收集状态。
-    struct PendingShot {
-        std::shared_ptr<ICameraDevice> dev;
-        uint64_t    baselineFrameCount = 0;  // 触发前的帧计数；超过它即为本次触发的新帧
-        bool        ready              = false;
-        bool        timedOut           = false;
-        QImage      color;
-        QImage      left;
-        QImage      right;
-        FrameTiming timing;
-    };
-
-    // 进行中的触发保存会话（GUI 线程独占，无需加锁）。
-    QTimer                  *triggerPollTimer_ = nullptr;  // 轮询新帧的定时器
-    std::vector<PendingShot> pendingShots_;
-    int                      pendingSeq_        = 0;
-    uint64_t                 pendingTriggerUs_  = 0;  // triggerAll 返回的派发时刻
-    qint64                   pendingDeadlineMs_ = 0;  // 等帧截止时刻（主机 ms）
+    // 后台触发线程：onTriggerSave 起线程跑阻塞的 captureTriggerSets，完成后发 triggerBatchReady。
+    std::thread       triggerThread_;
+    std::atomic<bool> triggerBusy_;  // 防重入：上一次触发未完成时不再起新线程
 };
 
 #endif  // MAIN_WINDOW_H

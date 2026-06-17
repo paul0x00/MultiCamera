@@ -64,8 +64,9 @@ void OrbbecBackend::syncDeviceClock() {
         return;
     }
     try {
-        // 0 = 同步一次，把主机与所有已打开设备的时钟对齐（多机时间戳可比较）。
-        context_->enableDeviceClockSync(0);
+        // 传入毫秒周期 → SDK 内部按该周期持续把主机与所有已打开设备的时钟对齐
+        // （多机时间戳可比较，并约束长时间漂移）。CameraManager 也会周期调用本函数兜底。
+        context_->enableDeviceClockSync(1000);
     } catch (const ob::Error &) {
         // 部分设备/连接方式不支持时钟同步，忽略。
     }

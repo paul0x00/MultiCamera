@@ -2,6 +2,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <thread>
+
+#include "TriggerBarrier.h"
 
 MindvisionCameraDevice::MindvisionCameraDevice(int handle, const DiscoveredDevice &info, bool mono)
     : handle_(handle),
@@ -96,12 +99,49 @@ bool MindvisionCameraDevice::trigger() {
     return CameraSoftTrigger(static_cast<CameraHandle>(handle_)) == CAMERA_STATUS_SUCCESS;
 }
 
+bool MindvisionCameraDevice::waitNewFrame(uint64_t baseline, int timeoutMs) const {
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (frameCount_.load() > baseline) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+}
+
+// 一次触发保存：屏障对齐后下发软触发，等新帧到达，取已切好的左右两半。
+bool MindvisionCameraDevice::captureTriggerSet(TriggerShot &out, TriggerBarrier &barrier, int perStepTimeoutMs) {
+    const uint64_t baseline = frameCount_.load();
+
+    // 屏障对齐：与其他厂商主曝光尽量同瞬间。
+    barrier.arrive();
+    barrier.wait();
+
+    trigger();  // 软触发出一帧（连续模式下此调用无害，靠下方等新帧）
+
+    if (waitNewFrame(baseline, perStepTimeoutMs)) {
+        out.left  = latestImage(PreviewStream::IRLeft);
+        out.right = latestImage(PreviewStream::IRRight);
+        latestFrameTiming(out.timing);
+    }
+    out.ok = !out.left.isNull() || !out.right.isNull();
+    return out.ok;
+}
+
 void MindvisionCameraDevice::calibrateClock(uint64_t hostRefUs) {
     // 清零设备时间戳，并请求下一帧以统一主机基准重锚（各机共用 hostRefUs）。
     if (handle_) {
         CameraRstTimeStamp(static_cast<CameraHandle>(handle_));
     }
     pendingHostRefUs_.store(hostRefUs);
+    pendingCalib_.store(true);
+}
+
+void MindvisionCameraDevice::syncClock() {
+    // 周期再锚：请求下一帧用其到达时刻的真实主机时间重锚，约束长时间漂移。
+    pendingHostRefUs_.store(nowEpochUs());
     pendingCalib_.store(true);
 }
 
@@ -145,18 +185,24 @@ void MindvisionCameraDevice::onFrame(BYTE *pFrameBuffer, tSdkFrameHead *pHead) {
             ispBuffer_.resize(need);
         }
         tSdkFrameHead outHead = *pHead;
-        QImage        img;
+        QImage        left, right;
         if (CameraImageProcess(h, pFrameBuffer, ispBuffer_.data(), &outHead) == CAMERA_STATUS_SUCCESS) {
-            if (mono_) {
-                img = QImage(ispBuffer_.data(), w, h2, w, QImage::Format_Grayscale8).copy();
-            } else {
-                img = QImage(ispBuffer_.data(), w, h2, w * 3, QImage::Format_RGB888).copy();
+            const QImage::Format fmt = mono_ ? QImage::Format_Grayscale8 : QImage::Format_RGB888;
+            const int            stride = mono_ ? w : w * 3;
+            // 整幅 = 左右目拼接，按列中点切两半（参照 python：frame[:, :half] / frame[:, half:]）。
+            const int half = w / 2;
+            if (half > 0) {
+                QImage full(ispBuffer_.data(), w, h2, stride, fmt);
+                // copy(矩形) 会脱离 ISP 缓冲，得到独立深拷贝。
+                left  = full.copy(0, 0, half, h2);
+                right = full.copy(half, 0, w - half, h2);
             }
         }
 
         {
             std::lock_guard<std::mutex> lk(frameMutex_);
-            latestImage_    = img;
+            latestLeft_     = left;
+            latestRight_    = right;
             lastExposureUs_ = pHead->uiExpTime;
             lastDevTsUs_    = devTsUs;
         }
@@ -168,15 +214,18 @@ void MindvisionCameraDevice::onFrame(BYTE *pFrameBuffer, tSdkFrameHead *pHead) {
 // ---------------- 预览 ----------------
 
 QImage MindvisionCameraDevice::latestImage(PreviewStream stream) const {
-    if (stream != PreviewStream::Color) {
-        return QImage();
-    }
     std::lock_guard<std::mutex> lk(frameMutex_);
-    return latestImage_;
+    if (stream == PreviewStream::IRLeft) {
+        return latestLeft_;
+    }
+    if (stream == PreviewStream::IRRight) {
+        return latestRight_;
+    }
+    return QImage();
 }
 
 std::string MindvisionCameraDevice::resolution(PreviewStream stream) const {
-    if (stream != PreviewStream::Color) {
+    if (stream != PreviewStream::IRLeft && stream != PreviewStream::IRRight) {
         return std::string();
     }
     const int w = width_.load();
@@ -184,25 +233,31 @@ std::string MindvisionCameraDevice::resolution(PreviewStream stream) const {
     if (w <= 0 || h <= 0) {
         return std::string();
     }
-    return std::to_string(w) + "x" + std::to_string(h);
+    // 单目 = 整幅按列中点切半。
+    return std::to_string(w / 2) + "x" + std::to_string(h);
 }
 
 std::vector<PreviewStream> MindvisionCameraDevice::availablePreviewStreams() const {
     std::vector<PreviewStream> v;
     std::lock_guard<std::mutex> lk(frameMutex_);
-    if (!latestImage_.isNull()) {
-        v.push_back(PreviewStream::Color);
+    if (!latestLeft_.isNull()) {
+        v.push_back(PreviewStream::IRLeft);
+    }
+    if (!latestRight_.isNull()) {
+        v.push_back(PreviewStream::IRRight);
     }
     return v;
 }
 
 std::string MindvisionCameraDevice::streamDiagnostics() const {
     std::lock_guard<std::mutex> lk(frameMutex_);
-    if (latestImage_.isNull()) {
+    if (latestLeft_.isNull() && latestRight_.isNull()) {
         return std::string("尚无帧到达");
     }
-    return std::string(mono_ ? "黑白" : "彩色") + "=" +
-           std::to_string(width_.load()) + "x" + std::to_string(height_.load());
+    return std::string(mono_ ? "黑白双目" : "彩色双目") + "  整幅=" +
+           std::to_string(width_.load()) + "x" + std::to_string(height_.load()) +
+           "  左=" + (latestLeft_.isNull() ? "无" : "有") +
+           "  右=" + (latestRight_.isNull() ? "无" : "有");
 }
 
 bool MindvisionCameraDevice::latestFrameTiming(FrameTiming &out) const {
@@ -210,7 +265,7 @@ bool MindvisionCameraDevice::latestFrameTiming(FrameTiming &out) const {
     uint32_t expUs;
     {
         std::lock_guard<std::mutex> lk(frameMutex_);
-        if (latestImage_.isNull()) {
+        if (latestLeft_.isNull() && latestRight_.isNull()) {
             return false;
         }
         devTs = lastDevTsUs_;

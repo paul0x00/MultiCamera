@@ -2,7 +2,10 @@
 
 #include <chrono>
 #include <cstring>
+#include <thread>
 #include <vector>
+
+#include "TriggerBarrier.h"
 
 namespace {
 // 海康帧 → QImage（深拷贝，跨线程安全）。Mono8 直接灰度；其余格式经 SDK 转 RGB8。
@@ -139,9 +142,45 @@ bool HikvisionCameraDevice::trigger() {
     return MV_CC_SetCommandValue(handle_, "TriggerSoftware") == MV_OK;
 }
 
+bool HikvisionCameraDevice::waitNewFrame(uint64_t baseline, int timeoutMs) const {
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (frameCount_.load() > baseline) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+}
+
+// 一次触发保存：屏障对齐后下发软触发（触发模式）或直接等下一新帧（连续模式），取彩色帧。
+bool HikvisionCameraDevice::captureTriggerSet(TriggerShot &out, TriggerBarrier &barrier, int perStepTimeoutMs) {
+    const uint64_t baseline = frameCount_.load();
+
+    // 屏障对齐：与其他厂商主曝光尽量同瞬间。
+    barrier.arrive();
+    barrier.wait();
+
+    trigger();  // 触发模式下出一帧；连续模式此调用返回 false 但无害，靠等新帧。
+
+    if (waitNewFrame(baseline, perStepTimeoutMs)) {
+        out.color = latestImage(PreviewStream::Color);
+        latestFrameTiming(out.timing);
+    }
+    out.ok = !out.color.isNull();
+    return out.ok;
+}
+
 void HikvisionCameraDevice::calibrateClock(uint64_t hostRefUs) {
     // 请求在下一帧重锚：把该帧设备时间戳与 hostRefUs 对齐，使各机落到同一主机轴。
     pendingHostRefUs_.store(hostRefUs);
+    pendingCalib_.store(true);
+}
+
+void HikvisionCameraDevice::syncClock() {
+    // 周期再锚：请求下一帧用其到达时刻的真实主机时间重锚，约束长时间漂移。
+    pendingHostRefUs_.store(nowEpochUs());
     pendingCalib_.store(true);
 }
 

@@ -14,6 +14,8 @@
 
 #include "ICameraDevice.h"
 
+class TriggerBarrier;
+
 // ICameraDevice 的 Orbbec 实现：持有 ob::Device 与 ob::Pipeline，负责采集、
 // 帧转换、参数（曝光/增益/自动曝光）以及软触发。
 //
@@ -47,6 +49,7 @@ public:
     std::string lastError() const override;
 
     bool trigger() override;
+    bool captureTriggerSet(TriggerShot &out, TriggerBarrier &barrier, int perStepTimeoutMs) override;
 
     // --- 参数控制 ---
     std::vector<ExposureTarget> supportedTargets() const override;
@@ -72,6 +75,13 @@ public:
 
 private:
     bool hasSensor(OBSensorType type) const { return sensors_.count(type) > 0; }
+
+    // 启动彩色预览（停掉一切现有流后），可选超时等首帧到达。失败设 lastError_。
+    bool startColorPreview(int waitFirstFrameMs);
+    // 启动单 IR 流且把 IR_CHANNEL_DATA_SOURCE 设为指定 channel（0=左、1=右）。
+    bool startIrChannel(int channel);
+    // 等下一帧到达（按 frameCount_ 增量判定），超时返回 false。
+    bool waitNewFrame(uint64_t baseline, int timeoutMs) const;
 
     void onFrameSet(const std::shared_ptr<ob::FrameSet> &frameSet);
     void setError(const std::string &msg);

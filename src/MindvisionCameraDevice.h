@@ -16,10 +16,13 @@
 
 #include "ICameraDevice.h"
 
-// ICameraDevice 的迈德威视实现：单路工业相机（彩色或黑白），映射到 PreviewStream::Color。
+class TriggerBarrier;
+
+// ICameraDevice 的迈德威视实现：一台双目相机输出一张左右拼接大图，软件按列中点切两半，
+// 左半 → PreviewStream::IRLeft，右半 → PreviewStream::IRRight（均为灰度，各 1280×1024）。
 //
 // 线程模型：帧经 SDK 内部线程经 CameraSetCallbackFunction 回调到达，回调里 ISP 处理成 RGB8/Mono8、
-// 转 QImage 加锁缓存并记录时间戳；GUI 线程通过 latestImage() 取副本。回调全程 try/catch(...) 兜底。
+// 切左右两半转 QImage 加锁缓存并记录时间戳；GUI 线程通过 latestImage() 取副本。回调全程 try/catch(...) 兜底。
 // 曝光/增益作用对象统一为 ExposureTarget::Industrial。设备时间戳 uiTimeStamp 单位 0.1ms，
 // CameraRstTimeStamp 可将其清零；标定时各机清零并锚定到统一主机基准，使帧时间戳跨机可比。
 class MindvisionCameraDevice : public ICameraDevice {
@@ -46,6 +49,7 @@ public:
     std::string lastError() const override;
 
     bool trigger() override;
+    bool captureTriggerSet(TriggerShot &out, TriggerBarrier &barrier, int perStepTimeoutMs) override;
 
     std::vector<ExposureTarget> supportedTargets() const override;
     bool                        isTargetSupported(ExposureTarget t) const override;
@@ -67,12 +71,14 @@ public:
     std::string                streamDiagnostics() const override;
     bool                       latestFrameTiming(FrameTiming &out) const override;
     void                       calibrateClock(uint64_t hostRefUs) override;
+    void                       syncClock() override;
 
 private:
     static void __stdcall frameCallback(CameraHandle h, BYTE *pFrameBuffer, tSdkFrameHead *pHead, PVOID ctx);
     void                  onFrame(BYTE *pFrameBuffer, tSdkFrameHead *pHead);
     void                  setError(const std::string &msg);
     static uint64_t       nowEpochUs();
+    bool                  waitNewFrame(uint64_t baseline, int timeoutMs) const;
 
     int  handle_;  // CameraHandle
     bool mono_;
@@ -102,7 +108,8 @@ private:
     std::string        lastError_;
 
     mutable std::mutex frameMutex_;
-    QImage             latestImage_;
+    QImage             latestLeft_;   // 左半（左目灰度）
+    QImage             latestRight_;  // 右半（右目灰度）
     uint32_t           lastExposureUs_ = 0;
     uint64_t           lastDevTsUs_    = 0;
 };
