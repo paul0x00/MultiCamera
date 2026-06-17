@@ -73,6 +73,13 @@ public:
     // 最新一帧代表帧的时间信息（见 FrameTiming）。hostEpochUs 落在主机 epoch 轴上，
     // 跨厂商可直接相减得曝光时刻差；无帧时返回 false。
     virtual bool latestFrameTiming(FrameTiming &out) const = 0;
+
+    // 时间戳标定：把本设备内部时钟对齐到主机时间轴。hostRefUs 为标定基准时刻
+    // （主机 system_clock epoch 微秒，由调用方在同一屏障上统一取值，保证多机共用一基准）。
+    // 实现可重置/锚定设备时钟，使此后各帧的 hostEpochUs 落在 hostRefUs 同一条轴上，
+    // 从而触发时各机帧时间戳可直接相减，间接反映曝光时刻差。
+    // 不支持的实现保持默认空实现（依赖既有的全局时间戳/锚点换算）。
+    virtual void calibrateClock(uint64_t hostRefUs) { (void)hostRefUs; }
 };
 
 #endif  // I_CAMERA_DEVICE_H

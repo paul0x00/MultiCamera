@@ -15,8 +15,8 @@ enum class CamState {
     Error        // 出错
 };
 
-// 曝光/增益的作用对象（结构光相机通常调 Depth/IR；单流工业相机仅 Color）。
-enum class ExposureTarget { Depth, IR, Color };
+// 曝光/增益的作用对象（结构光相机通常调 Depth/IR；单流工业相机用 Industrial）。
+enum class ExposureTarget { Depth, IR, Color, Industrial };
 
 // 预览流类型。IRLeft/IRRight 仅用于触发保存时分别取左右红外帧，不参与预览选择。
 enum class PreviewStream { Depth, IR, Color, IRLeft, IRRight };
@@ -58,6 +58,7 @@ inline const char *exposureTargetName(ExposureTarget t) {
     case ExposureTarget::Depth: return "深度";
     case ExposureTarget::IR:    return "红外";
     case ExposureTarget::Color: return "彩色";
+    case ExposureTarget::Industrial: return "工业";
     }
     return "";
 }

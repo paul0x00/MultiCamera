@@ -3,6 +3,10 @@
 #include <chrono>
 
 #include "OrbbecBackend.h"
+#ifdef _WIN32
+#include "HikvisionBackend.h"
+#include "MindvisionBackend.h"
+#endif
 
 namespace {
 // 当前主机 system_clock 的 epoch 微秒（与各设备 FrameTiming 的公共时间轴一致）。
@@ -15,8 +19,12 @@ uint64_t nowEpochUs() {
 }  // namespace
 
 CameraManager::CameraManager() : abortStart_(false), capturing_(false) {
-    // 注册可用后端；接入新厂商（如迈德威视）时在此追加。
+    // 注册可用后端；接入新厂商时在此追加。海康/迈德威视 SDK 仅 Windows 可用。
     backends_.push_back(std::make_shared<OrbbecBackend>());
+#ifdef _WIN32
+    backends_.push_back(std::make_shared<HikvisionBackend>());
+    backends_.push_back(std::make_shared<MindvisionBackend>());
+#endif
 }
 
 CameraManager::~CameraManager() {
@@ -109,6 +117,46 @@ void CameraManager::syncDeviceClocks() {
     }
 }
 
+uint64_t CameraManager::calibrateClocks() {
+    // 先做后端级时钟同步（如 Orbbec 上下文级对齐）。
+    syncDeviceClocks();
+
+    std::vector<std::shared_ptr<ICameraDevice>> devs = connectedDevices();
+    if (devs.empty()) {
+        return nowEpochUs();
+    }
+    // 并行屏障：各设备线程先就位，主线程统一取一次 hostRef 并释放，
+    // 让所有 calibrateClock(hostRef) 用同一基准、近乎同瞬间执行。
+    std::atomic<bool> go(false);
+    std::atomic<int>  ready(0);
+    std::atomic<uint64_t> hostRef(0);
+    const int             n = static_cast<int>(devs.size());
+
+    std::vector<std::thread> workers;
+    workers.reserve(devs.size());
+    for (size_t i = 0; i < devs.size(); ++i) {
+        std::shared_ptr<ICameraDevice> dev = devs[i];
+        workers.push_back(std::thread([&go, &ready, &hostRef, dev]() {
+            ready.fetch_add(1);
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            dev->calibrateClock(hostRef.load());
+        }));
+    }
+    while (ready.load() < n) {
+        std::this_thread::yield();
+    }
+    const uint64_t tRef = nowEpochUs();
+    hostRef.store(tRef);
+    go.store(true, std::memory_order_release);
+
+    for (size_t i = 0; i < workers.size(); ++i) {
+        workers[i].join();
+    }
+    return tRef;
+}
+
 void CameraManager::disconnect(const std::string &serial) {
     std::shared_ptr<ICameraDevice> target;
     {
@@ -159,8 +207,8 @@ void CameraManager::joinStartThread() {
     }
 }
 
-void CameraManager::startCapture(int intervalMs, bool triggerMode) {
-    // 先确保上一次的启动线程已结束
+void CameraManager::startCapture(bool triggerMode) {
+    // 确保上一次的启动线程已结束
     abortStart_.store(true);
     joinStartThread();
     abortStart_.store(false);
@@ -171,30 +219,10 @@ void CameraManager::startCapture(int intervalMs, bool triggerMode) {
     }
     capturing_.store(true);
 
-    if (intervalMs < 0) {
-        intervalMs = 0;
+    // 一次性启动所有相机的采集（不再错峰；多机同步由时间戳标定 + 软触发屏障保证）。
+    for (size_t i = 0; i < devs.size(); ++i) {
+        devs[i]->startStream(triggerMode);
     }
-
-    startThread_ = std::thread([this, devs, intervalMs, triggerMode]() {
-        for (size_t i = 0; i < devs.size(); ++i) {
-            if (abortStart_.load()) {
-                break;
-            }
-            if (i > 0 && intervalMs > 0) {
-                // 分片睡眠，便于及时响应停止
-                int remaining = intervalMs;
-                while (remaining > 0 && !abortStart_.load()) {
-                    const int step = remaining > 20 ? 20 : remaining;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(step));
-                    remaining -= step;
-                }
-                if (abortStart_.load()) {
-                    break;
-                }
-            }
-            devs[i]->startStream(triggerMode);
-        }
-    });
 }
 
 void CameraManager::stopCapture() {

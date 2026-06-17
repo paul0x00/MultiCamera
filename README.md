@@ -2,8 +2,9 @@
 
 基于 **C++11 + Qt + Orbbec SDK 2.8.6** 的桌面端多相机控制软件，用于同时控制多组奥比中光 Gemini 215 相机模组。
 
-- 本机（macOS / Apple Silicon）使用已安装的 **Qt 6.10.2** 跑通；
-- 源码按 **C++11** 规范编写，可在 **Windows + Qt 5.12** 下编译（见下方"跨平台说明"）。
+- 当前本机环境已使用 **Windows + Qt 6.9.0 + MinGW 13.1** 编译通过；
+- 源码按 **C++11** 规范编写，CMake 会按 Qt 主版本自动切换到 `Qt6 -> C++17`、`Qt5 -> C++11`；
+- 仍兼容 **Windows + Qt 5.12 / MSVC2015** 的目标构建方式（见下方"跨平台说明"）。
 
 ## 功能
 
@@ -23,6 +24,7 @@
 ```
 gemini215/
 ├── CMakeLists.txt              # 跨平台构建（Qt6/Qt5 版本无关；SDK 按平台分支）
+├── CMakePresets.json           # 当前本机 Qt 6.9 + MinGW 构建预设
 ├── README.md
 ├── .gitignore
 ├── src/                        # 全部应用源码
@@ -47,19 +49,36 @@ gemini215/
 
 ## 构建与运行
 
-### macOS（本机，Qt 6.10.2）
+### Windows（当前本机环境，Qt 6.9.0 + MinGW 13.1）
 
-```bash
-cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH=/Users/paul/tool/Qt/6.10.2/macos
-cmake --build build
-./build/gemini215_viewer
+推荐直接使用仓库内预设：
+
+```powershell
+cmake --preset qt69-mingw-debug
+cmake --build --preset build-qt69-mingw-debug
 ```
 
-> CMakeLists 内置了本机 Qt 路径的兜底，未传 `CMAKE_PREFIX_PATH` 也能配置成功。
-> 可执行文件通过 `@rpath` 自动定位 `lib/libOrbbecSDK.2.dylib`；`extensions/` 与
-> `OrbbecSDKConfig.xml` 会在构建后自动拷到可执行文件目录。
+- 该预设固定使用：
+  - `F:/Qt6.9/6.9.0/mingw_64`
+  - `F:/Qt6.9/Tools/mingw1310_64/bin/g++.exe`
+  - `F:/Qt6.9/Tools/mingw1310_64/bin/mingw32-make.exe`
+- 构建产物位于 `build/qt69-mingw-debug/`。
+- `OrbbecSDK.dll` 会在构建后自动拷到 exe 同目录；若检测到 `windeployqt`，还会自动部署 Qt 运行库。
 
-### Windows（目标平台，MSVC2015 + Qt 5.12）
+如需手动指定而不使用 preset：
+
+```powershell
+cmake -S . -B build/qt69-mingw-debug -G "MinGW Makefiles" ^
+      -DCMAKE_PREFIX_PATH=F:/Qt6.9/6.9.0/mingw_64 ^
+      -DCMAKE_CXX_COMPILER=F:/Qt6.9/Tools/mingw1310_64/bin/g++.exe ^
+      -DCMAKE_MAKE_PROGRAM=F:/Qt6.9/Tools/mingw1310_64/bin/mingw32-make.exe
+cmake --build build/qt69-mingw-debug --parallel 4
+```
+
+> `CMakeLists.txt` 在 Windows 下内置了 `F:/Qt6.9/6.9.0/mingw_64` 的默认 Qt 搜索路径；
+> 但要避免误用系统里其它 MinGW，当前环境更推荐始终走 `CMakePresets.json`。
+
+### Windows（兼容目标平台，MSVC2015 + Qt 5.12）
 
 把整个工程目录拷到 Windows 后：
 
@@ -79,25 +98,27 @@ cmake --build build --config Release
 
 ## 跨平台说明（重要）
 
-| | 本机 macOS | Windows 目标 |
+| | 当前本机环境 | 兼容目标环境 |
 |---|---|---|
-| Qt | 6.10.2 | 5.12 |
+| 平台 | Windows + MinGW | Windows + MSVC2015 |
+| Qt | 6.9.0 | 5.12 |
 | C++ 标准 | C++17（Qt6 强制要求） | C++11 |
 
 - **源码本身严格按 C++11 编写**（未使用 `make_unique`、泛型 lambda、结构化绑定等 C++14/17 语言特性），
   因此在 Windows + Qt5.12 下用 `-std=c++11` 可正常编译。
-- 本机仅装有 Qt6，而 **Qt6 头文件强制需要 C++17**，故 CMake 会自动按 Qt 主版本切换标准：
+- 当前本机使用 Qt6，而 **Qt6 头文件强制需要 C++17**，故 CMake 会自动按 Qt 主版本切换标准：
   `Qt6 → C++17`、`Qt5 → C++11`。两种标准编译的是同一份 C++11 级别代码。
 - 界面只使用 Qt5/Qt6 共有的 API；`CMakeLists` 用 `find_package(QT NAMES Qt6 Qt5 ...)`
   版本无关写法，两端共用同一份工程文件。
+- 若本机同时装有多套 MinGW，**Qt6 应优先配套使用 Qt 安装目录中的 MinGW 工具链**，否则可能出现链接不兼容。
 
 ## 已验证 / 待真机验证
 
 本机已验证（无相机环境）：
-- ✅ Qt6.10 + C++17 下编译零错误、链接成功；
+- ✅ Windows + Qt6.9.0 + MinGW 13.1 + C++17 下编译零错误、链接成功；
 - ✅ 程序启动、主界面构建、30fps 刷新事件循环稳定运行；
-- ✅ SDK Context 初始化、设备枚举（当前 0 台）无异常、无崩溃；
-- ✅ dylib 经 rpath 正确加载。
+- ✅ `windeployqt` 自动部署 Qt 运行库，`OrbbecSDK.dll` 自动拷贝完成；
+- ✅ SDK Context 初始化、设备枚举（当前 0 台）无异常、无崩溃。
 
 需要插上 Gemini 215 后实测：
 - 设备连接 / 采集取流 / 预览画面；

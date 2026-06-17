@@ -111,7 +111,29 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
     populateParamPanel();
     updateButtonStates();
-    log(QString::fromUtf8("就绪。点击\"全部连接\"枚举并连接所有相机，再\"开始采集\"。"));
+
+    // 启动即枚举所有厂商设备并在日志列出（不自动连接，连接由"全部连接"触发）。
+    {
+        std::vector<DiscoveredDevice> list = manager_.refresh();
+        if (list.empty()) {
+            const std::string err = manager_.lastError();
+            if (!err.empty()) {
+                log(QString::fromUtf8("启动枚举：") + QString::fromStdString(err), true);
+            } else {
+                log(QString::fromUtf8("启动枚举：未发现相机设备。点击\"全部连接\"可重试。"));
+            }
+        } else {
+            log(QString::fromUtf8("启动枚举：发现 %1 台相机：").arg(static_cast<int>(list.size())));
+            for (size_t i = 0; i < list.size(); ++i) {
+                log(QString::fromUtf8("  [%1] %2  序列号=%3  接口=%4")
+                        .arg(QString::fromStdString(list[i].vendor))
+                        .arg(QString::fromStdString(list[i].name))
+                        .arg(QString::fromStdString(list[i].serial))
+                        .arg(QString::fromStdString(list[i].connectionType)));
+            }
+            log(QString::fromUtf8("点击\"全部连接\"连接所有相机，再\"开始采集\"。"));
+        }
+    }
 }
 
 MainWindow::~MainWindow() {
@@ -143,14 +165,9 @@ QWidget *MainWindow::buildCapturePanel() {
     r1->addWidget(btnStop_);
     v->addLayout(r1);
 
-    QFormLayout *form = new QFormLayout();
-    intervalSpin_     = new QSpinBox(g);
-    intervalSpin_->setRange(0, 60000);
-    intervalSpin_->setValue(0);
-    intervalSpin_->setSuffix(QString::fromUtf8(" ms"));
-    intervalSpin_->setToolTip(QString::fromUtf8("错峰启动采集时，依次启动各相机的时间间隔"));
-    form->addRow(QString::fromUtf8("采集间隔"), intervalSpin_);
-    v->addLayout(form);
+    btnCalibrate_ = new QPushButton(QString::fromUtf8("时间戳标定"), g);
+    btnCalibrate_->setToolTip(QString::fromUtf8("对齐所有相机的内部时钟到同一主机时间轴；触发保存时各路帧时间戳可直接相减，反映曝光时刻差。可随时重复标定。"));
+    v->addWidget(btnCalibrate_);
 
     btnTrigger_ = new QPushButton(QString::fromUtf8("触发保存"), g);
     btnTrigger_->setProperty("primary", true);
@@ -161,6 +178,7 @@ QWidget *MainWindow::buildCapturePanel() {
     connect(btnDisconnectAll_, &QPushButton::clicked, this, [this]() { onDisconnectAll(); });
     connect(btnStart_, &QPushButton::clicked, this, [this]() { onStartCapture(); });
     connect(btnStop_, &QPushButton::clicked, this, [this]() { onStopCapture(); });
+    connect(btnCalibrate_, &QPushButton::clicked, this, [this]() { onCalibrateClocks(); });
     connect(btnTrigger_, &QPushButton::clicked, this, [this]() { onTriggerSave(); });
 
     return g;
@@ -292,9 +310,20 @@ void MainWindow::onStartCapture() {
         log(QString::fromUtf8("没有已连接的相机，无法开始采集。"));
         return;
     }
-    const int interval = intervalSpin_->value();
-    manager_.startCapture(interval, false);  // 连续模式，实时预览彩色
-    log(QString::fromUtf8("开始采集：间隔 %1 ms，连续模式。").arg(interval));
+    manager_.startCapture(false);  // 连续模式，实时预览
+    log(QString::fromUtf8("开始采集：所有相机连续模式。"));
+    updateButtonStates();
+}
+
+void MainWindow::onCalibrateClocks() {
+    if (manager_.connectedCount() == 0) {
+        log(QString::fromUtf8("没有已连接的相机，无法标定。"));
+        return;
+    }
+    const uint64_t ref = manager_.calibrateClocks();
+    log(QString::fromUtf8("时间戳标定完成：%1 台相机已对齐到主机基准 %2 µs。")
+            .arg(static_cast<int>(manager_.connectedCount()))
+            .arg(static_cast<qulonglong>(ref)));
     updateButtonStates();
 }
 
@@ -721,7 +750,7 @@ void MainWindow::updateButtonStates() {
 
     btnStart_->setEnabled(!capturing && connected > 0);
     btnStop_->setEnabled(capturing);
-    intervalSpin_->setEnabled(!capturing);
+    btnCalibrate_->setEnabled(connected > 0);   // 连接后随时可标定（采集中亦可）
     btnTrigger_->setEnabled(capturing);  // 采集中随时可触发保存
 }
 

@@ -1,0 +1,32 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 23,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "qt69-mingw-debug",
+      "displayName": "Qt 6.9 MinGW Debug",
+      "generator": "MinGW Makefiles",
+      "binaryDir": "${sourceDir}/build/qt69-mingw-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_PREFIX_PATH": "F:/Qt6.9/6.9.0/mingw_64",
+        "CMAKE_CXX_COMPILER": "F:/Qt6.9/Tools/mingw1310_64/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "F:/Qt6.9/Tools/mingw1310_64/bin/mingw32-make.exe"
+      },
+      "environment": {
+        "PATH": "F:/Qt6.9/Tools/mingw1310_64/bin;$penv{PATH}"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-qt69-mingw-debug",
+      "configurePreset": "qt69-mingw-debug",
+      "jobs": 4
+    }
+  ]
+}

@@ -60,6 +60,7 @@ private:
     void onStartCapture();
     void onStopCapture();
     void onTriggerSave();  // 对所有相机同时下发软触发，等齐各路新帧后保存并记录时间戳
+    void onCalibrateClocks();  // 时间戳标定：对齐各机内部时钟到同一主机轴
     void onTick();
 
     // 触发保存流程（非阻塞）：onTriggerSave 下发触发并起轮询定时器；
@@ -94,7 +95,7 @@ private:
     QPushButton *btnStart_     = nullptr;
     QPushButton *btnStop_      = nullptr;
     QPushButton *btnTrigger_   = nullptr;  // 触发保存
-    QSpinBox    *intervalSpin_ = nullptr;
+    QPushButton *btnCalibrate_ = nullptr;  // 时间戳标定
 
     // 参数面板
     QComboBox *targetCombo_   = nullptr;

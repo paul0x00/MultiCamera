@@ -37,9 +37,13 @@ public:
     // 同步所有后端已打开设备的时钟（多机时间戳对齐）。连接成功后自动调用。
     void syncDeviceClocks();
 
-    // 错峰启动采集：依次启动每台已连接相机，相邻两台间隔 intervalMs 毫秒。
-    // 启动在后台线程进行，不阻塞调用者（GUI）。
-    void startCapture(int intervalMs, bool triggerMode);
+    // 时间戳标定：在同一屏障上对所有已连接设备下发 calibrateClock(同一主机基准)，
+    // 使各机内部时钟对齐到同一主机轴，触发存图时帧时间戳可直接相减。
+    // 返回标定基准时刻（主机 system_clock epoch 微秒）。可随时手动调用。
+    uint64_t calibrateClocks();
+
+    // 启动采集：一次性启动所有已连接相机（triggerMode=true 为软触发模式）。
+    void startCapture(bool triggerMode);
     void stopCapture();
     bool isCapturing() const { return capturing_.load(); }
 
